@@ -1,0 +1,2499 @@
+import type { Express, Request, Response } from "express";
+import { createServer, type Server } from "http";
+import { WebSocketServer } from "ws";
+import WebSocket from "ws";
+import { storage } from "./storage";
+import { GameManager } from "./game/gameManager";
+import { z } from "zod";
+import * as schema from "@shared/schema";
+import { insertUserSchema, insertGameSchema, insertMessageSchema, InsertGame } from "@shared/schema";
+import bcrypt from "bcrypt";
+import crypto from "crypto";
+import session from "express-session";
+import { paymentProcessing } from "./utils/payment";
+import Stripe from "stripe";
+import paystackRoutes from "./routes/paystack";
+import transactionRoutes from "./routes/transactions";
+import currencyRoutes from "./routes/currency";
+import { AVAILABLE_CURRENCIES } from "./routes/currency";
+import { addMinutes, addHours, addDays } from "date-fns";
+import { 
+  generateVerificationToken, 
+  generatePasswordResetToken, 
+  sendVerificationEmail, 
+  sendPasswordResetEmail, 
+  sendTransactionEmail 
+} from "./utils/email";
+import { db } from "./db";
+import { eq } from "drizzle-orm";
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  console.error('Missing required Stripe secret: STRIPE_SECRET_KEY');
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
+  apiVersion: "2023-10-16" as any,
+});
+
+// Import the PostgreSQL session store
+import { sessionStore } from "./storage";
+
+// Configure the session middleware
+const sessionMiddleware = session({
+  secret: process.env.SESSION_SECRET || "bbg-game-secret",
+  resave: false,
+  saveUninitialized: false,
+  store: sessionStore,
+  cookie: {
+    httpOnly: true,
+    secure: false, // Set to false for development to work with http
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days for longer session persistence
+    path: '/'
+  }
+});
+
+declare module 'express-session' {
+  interface SessionData {
+    userId: number;
+  }
+}
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Initialize server
+  const httpServer = createServer(app);
+  
+  // Register payment and transaction routes
+  app.use('/api/payment', paystackRoutes);
+  app.use('/api/transactions', transactionRoutes);
+  app.use('/api/currencies', currencyRoutes);
+  
+  // Initialize game manager
+  const gameManager = new GameManager(storage);
+  
+  // Map to store voice chat rooms (roomId -> Map of peerId -> WebSocket)
+  const voiceRooms = new Map<string, Map<string, WebSocket>>();
+  
+  // Initialize WebSocket server
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  
+  // Session middleware
+  app.use(sessionMiddleware);
+  
+  // Debug session middleware to track session initialization
+  app.use((req, res, next) => {
+    // Skip logging for static assets and HMR requests to reduce noise
+    if (!req.path.includes('.') && !req.path.includes('__vite')) {
+      console.log(`Debug - Session check - Path: ${req.method} ${req.path} | Session ID: ${req.session.id}, User ID: ${req.session.userId || 'not logged in'}`);
+    }
+    next();
+  });
+  
+  // Authentication middleware
+  const authenticate = (req: Request, res: Response, next: Function) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    // At this point, userId is guaranteed to exist
+    next();
+  };
+  
+  // Admin usernames - must match the ones in the client's useAdmin hook
+  const ADMIN_USERNAMES = ["admin", "precious"];
+  
+  // Admin authentication middleware 
+  const authenticateAdmin = async (req: Request, res: Response, next: Function) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    
+    // Get user by ID
+    const user = await storage.getUser(req.session.userId);
+    if (!user) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    
+    // Check if user is admin
+    if (!ADMIN_USERNAMES.includes(user.username)) {
+      return res.status(403).json({ message: "Forbidden - Admin access required" });
+    }
+    
+    // User is admin
+    next();
+  };
+  
+  // Type guard to ensure userId exists
+  function ensureUserIdExists(userId: number | undefined): asserts userId is number {
+    if (userId === undefined) {
+      throw new Error("User ID is undefined");
+    }
+  }
+  
+  // Authentication routes
+  app.post("/api/register", async (req, res) => {
+    try {
+      const validatedData = insertUserSchema.parse(req.body);
+      
+      // Check if username already exists
+      const existingUser = await storage.getUserByUsername(validatedData.username);
+      if (existingUser) {
+        return res.status(400).json({ message: "Username already exists" });
+      }
+      
+      // Check if email already exists
+      const existingEmail = await storage.getUserByEmail(validatedData.email);
+      if (existingEmail) {
+        return res.status(400).json({ message: "Email already exists" });
+      }
+      
+      // Hash password
+      const saltRounds = 10;
+      const hashedPassword = await bcrypt.hash(validatedData.password, saltRounds);
+      
+      // Check if email verification should be skipped
+      // This can be controlled by environment variable or specific test email domains
+      const skipEmailVerification = process.env.SKIP_EMAIL_VERIFICATION === 'true';
+      const testDomains = ['test.com', 'example.com', 'gmail.com']; // Add common test domains
+      const isTestEmail = testDomains.some(domain => validatedData.email.endsWith(domain));
+      
+      // For development, we'll skip verification by default
+      const shouldSkipVerification = 
+        skipEmailVerification || 
+        isTestEmail || 
+        process.env.NODE_ENV === 'development';
+      
+      let verificationToken = null;
+      let tokenExpiry = null;
+      
+      // Only generate token if we're not skipping verification
+      if (!shouldSkipVerification) {
+        verificationToken = generateVerificationToken();
+        tokenExpiry = addDays(new Date(), 3); // Token valid for 3 days
+      }
+      
+      // Create user with verification token (or verified status if skipping)
+      const user = await storage.createUser({
+        ...validatedData,
+        password: hashedPassword,
+        avatarInitials: validatedData.avatarInitials || validatedData.username.substring(0, 2).toUpperCase(),
+        verificationToken,
+        verificationTokenExpires: tokenExpiry,
+        emailVerified: shouldSkipVerification // Auto-verify if skipping verification
+      });
+      
+      // Only send verification email if not skipping verification
+      if (!shouldSkipVerification) {
+        await sendVerificationEmail(user.email, verificationToken as string);
+        console.log('User registered, verification email sent:', user.id);
+      } else {
+        console.log('User registered with auto-verification (skipped email):', user.id);
+      }
+      
+      // Remove sensitive data from response
+      const { password, verificationToken: token, ...userWithoutSensitiveInfo } = user;
+      
+      // If verification is skipped, log the user in immediately by setting the session
+      if (shouldSkipVerification) {
+        req.session.userId = user.id;
+        console.log(`Auto-login for verified user ${user.id}, session ID: ${req.session.id}`);
+        
+        res.status(201).json({ 
+          ...userWithoutSensitiveInfo,
+          message: "Registration successful. Email verification skipped for development."
+        });
+      } else {
+        // Otherwise, don't log in and show verification message
+        res.status(201).json({ 
+          ...userWithoutSensitiveInfo,
+          message: "Registration successful. Please check your email to verify your account."
+        });
+      }
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0].message });
+      }
+      console.error('Registration error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.post("/api/login", async (req, res) => {
+    try {
+      console.log('Login attempt with:', req.body);
+      const { username, password } = req.body;
+      
+      // Get user by username
+      const user = await storage.getUserByUsername(username);
+      if (!user) {
+        console.log(`User not found with username: ${username}`);
+        return res.status(401).json({ message: "Invalid username or password" });
+      }
+      
+      console.log(`User found: ${user.id} (${user.username})`);
+      
+      // Check password
+      const passwordMatch = await bcrypt.compare(password, user.password);
+      if (!passwordMatch) {
+        console.log('Password mismatch');
+        return res.status(401).json({ message: "Invalid username or password" });
+      }
+      
+      console.log('Password match successful');
+      
+      // Check if user has verified their email
+      if (!user.emailVerified) {
+        console.log('User email not verified:', user.email);
+        
+        // Generate a new verification token if needed
+        if (!user.verificationToken || new Date() > (user.verificationTokenExpires || new Date())) {
+          console.log('Generating new verification token');
+          const newVerificationToken = generateVerificationToken();
+          const newTokenExpiry = addDays(new Date(), 3);
+          
+          // Update user with new verification token
+          await storage.updateUserProfile(user.id, {
+            verificationToken: newVerificationToken,
+            verificationTokenExpires: newTokenExpiry
+          });
+          
+          // Send new verification email
+          await sendVerificationEmail(user.email, newVerificationToken);
+        } else {
+          console.log('Resending existing verification token');
+          // Token is still valid, resend the existing one
+          await sendVerificationEmail(user.email, user.verificationToken as string);
+        }
+        
+        return res.status(403).json({ 
+          message: "Email not verified. A new verification link has been sent to your email."
+        });
+      }
+      
+      console.log('Email verified, proceeding with login');
+      
+      // Set session
+      req.session.userId = user.id;
+      console.log(`Set session userId to ${user.id}, session ID: ${req.session.id}`);
+      
+      // Save session explicitly
+      req.session.save((err) => {
+        if (err) {
+          console.error('Session save error:', err);
+          return res.status(500).json({ message: "Failed to create session" });
+        }
+        
+        console.log(`Session saved successfully for user ${user.id}`);
+        
+        // Remove password from response
+        const { password: _, ...userWithoutPassword } = user;
+        console.log('User logged in:', user.id);
+        res.json(userWithoutPassword);
+      });
+    } catch (error) {
+      console.error('Login error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.post("/api/logout", (req, res) => {
+    req.session.destroy((err) => {
+      if (err) {
+        return res.status(500).json({ message: "Failed to logout" });
+      }
+      res.json({ message: "Logged out successfully" });
+    });
+  });
+  
+  app.get("/api/user", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        req.session.destroy(() => {});
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      // Remove password from response
+      const { password, ...userWithoutPassword } = user;
+      
+      res.json(userWithoutPassword);
+    } catch (error) {
+      console.error('Error fetching user:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Update user preferences
+  app.patch("/api/user/preferences", authenticate, async (req, res) => {
+    try {
+      // Validate user exists
+      ensureUserIdExists(req.session.userId);
+      
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        req.session.destroy(() => {});
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      // Create a schema for user preferences updates
+      const userPreferencesSchema = z.object({
+        preferredCurrency: z.string().min(3).max(3).optional(),
+        countryCode: z.string().min(2).max(2).optional(),
+        language: z.string().min(2).max(5).optional(),
+        emailNotifications: z.boolean().optional(),
+      });
+      
+      // Validate request body
+      const validationResult = userPreferencesSchema.safeParse(req.body);
+      
+      if (!validationResult.success) {
+        return res.status(400).json({
+          message: "Invalid preferences data",
+          errors: validationResult.error.format()
+        });
+      }
+      
+      // Check if currency is valid when provided
+      if (
+        validationResult.data.preferredCurrency && 
+        !Object.keys(AVAILABLE_CURRENCIES).includes(validationResult.data.preferredCurrency)
+      ) {
+        return res.status(400).json({
+          message: `Currency ${validationResult.data.preferredCurrency} is not supported`
+        });
+      }
+      
+      // Update user with new preferences
+      const updatedUser = await storage.updateUserProfile(
+        req.session.userId, 
+        validationResult.data
+      );
+      
+      // Remove password from response
+      const { password, ...userWithoutPassword } = updatedUser;
+      
+      res.json({
+        ...userWithoutPassword,
+        message: "Preferences updated successfully"
+      });
+    } catch (error) {
+      console.error('Error updating user preferences:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Update user profile
+  app.patch("/api/user/profile", authenticate, async (req, res) => {
+    try {
+      // Validate user exists
+      ensureUserIdExists(req.session.userId);
+      
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        req.session.destroy(() => {});
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      // Create a schema for profile updates
+      const userProfileSchema = z.object({
+        username: z.string().min(3, { message: "Username must be at least 3 characters" }).optional(),
+        email: z.string().email({ message: "Please enter a valid email address" }).optional(),
+        avatarInitials: z.string().max(2, { message: "Avatar initials must be max 2 characters" }).optional(),
+        emailNotifications: z.boolean().optional(),
+        countryCode: z.string().min(2).max(2).optional(),
+        preferredCurrency: z.string().min(3).max(3).optional(),
+      });
+      
+      // Validate request body
+      const validationResult = userProfileSchema.safeParse(req.body);
+      
+      if (!validationResult.success) {
+        return res.status(400).json({
+          message: "Invalid profile data",
+          errors: validationResult.error.format()
+        });
+      }
+      
+      // Check if username is being changed and if it's already taken
+      if (
+        validationResult.data.username && 
+        validationResult.data.username !== user.username
+      ) {
+        const existingUser = await storage.getUserByUsername(validationResult.data.username);
+        if (existingUser && existingUser.id !== user.id) {
+          return res.status(400).json({
+            message: "Username already exists",
+          });
+        }
+      }
+      
+      // Check if email is being changed and if it's already taken
+      if (
+        validationResult.data.email && 
+        validationResult.data.email !== user.email
+      ) {
+        const existingUser = await storage.getUserByEmail(validationResult.data.email);
+        if (existingUser && existingUser.id !== user.id) {
+          return res.status(400).json({
+            message: "Email already exists",
+          });
+        }
+      }
+      
+      // Check if preferredCurrency is valid when provided
+      if (validationResult.data.preferredCurrency) {
+        const { AVAILABLE_CURRENCIES } = await import('./routes/currency');
+        if (!AVAILABLE_CURRENCIES[validationResult.data.preferredCurrency]) {
+          return res.status(400).json({
+            message: `Currency ${validationResult.data.preferredCurrency} is not supported`
+          });
+        }
+      }
+      
+      // Update user profile
+      const updatedUser = await storage.updateUserProfile(
+        req.session.userId, 
+        validationResult.data
+      );
+      
+      // Remove password from response
+      const { password, ...userWithoutPassword } = updatedUser;
+      
+      res.json({
+        ...userWithoutPassword,
+        message: "Profile updated successfully"
+      });
+    } catch (error) {
+      console.error('Error updating user profile:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Email verification routes - both GET (for link clicks) and POST (for API calls)
+  const handleEmailVerification = async (token: string, res: Response) => {
+    try {
+      console.log("Handling email verification for token:", token);
+      
+      // Find user with this verification token
+      const users = await db.select().from(schema.users).where(eq(schema.users.verificationToken, token));
+      
+      console.log("Users found with token:", users.length);
+      
+      if (users.length === 0) {
+        console.log("No user found with verification token:", token);
+        res.status(400).json({ message: "Invalid or expired verification token" });
+        return null;
+      }
+      
+      const user = users[0];
+      console.log("User found:", user.id, user.username);
+      
+      // Check if token has expired
+      if (user.verificationTokenExpires && new Date() > user.verificationTokenExpires) {
+        console.log("Token expired at:", user.verificationTokenExpires);
+        res.status(400).json({ message: "Verification token has expired" });
+        return null;
+      }
+      
+      console.log("Updating user to mark email as verified");
+      
+      // Update user to mark email as verified
+      await storage.updateUserProfile(user.id, {
+        emailVerified: true,
+        verificationToken: null,
+        verificationTokenExpires: null
+      });
+      
+      console.log("User successfully verified:", user.id);
+      return user;
+    } catch (error) {
+      console.error("Email verification error:", error);
+      throw error;
+    }
+  };
+  
+  // GET route for email verification (clicked from email)
+  app.get("/api/verify-email/:token", async (req, res) => {
+    try {
+      console.log("GET verification request for token:", req.params.token);
+      const { token } = req.params;
+      const user = await handleEmailVerification(token, res);
+      
+      if (!user) {
+        console.log("Verification failed in GET route - already handled");
+        return; // Error already handled in the function
+      }
+      
+      // Redirect to login page with success message
+      console.log("Redirecting to login page with verified flag");
+      res.redirect(`/auth?verified=true`);
+    } catch (error) {
+      console.error("Email verification error in GET route:", error);
+      res.status(500).json({ message: "Failed to verify email" });
+    }
+  });
+  
+  // POST route for email verification (called from frontend)
+  app.post("/api/verify-email/:token", async (req, res) => {
+    try {
+      console.log("POST verification request for token:", req.params.token);
+      const { token } = req.params;
+      const user = await handleEmailVerification(token, res);
+      
+      if (!user) {
+        console.log("Verification failed in POST route - already handled");
+        return; // Error already handled in the function
+      }
+      
+      console.log("Sending success response for verified email");
+      res.status(200).json({ 
+        message: "Email verified successfully",
+        verified: true
+      });
+    } catch (error) {
+      console.error("Email verification error in POST route:", error);
+      res.status(500).json({ message: "Failed to verify email" });
+    }
+  });
+  
+  // Resend verification email
+  app.post("/api/resend-verification", async (req, res) => {
+    try {
+      const { email } = req.body;
+      
+      if (!email) {
+        return res.status(400).json({ message: "Email is required" });
+      }
+      
+      // Find user by email
+      const user = await storage.getUserByEmail(email);
+      
+      if (!user) {
+        // Don't reveal if email exists for security
+        return res.status(200).json({ message: "If your email is registered, you will receive a verification link" });
+      }
+      
+      // Check if already verified
+      if (user.emailVerified) {
+        return res.status(400).json({ message: "Email is already verified" });
+      }
+      
+      // Generate new verification token
+      const verificationToken = generateVerificationToken();
+      const tokenExpiry = addDays(new Date(), 3);
+      
+      // Update user with new token
+      await storage.updateUserProfile(user.id, {
+        verificationToken,
+        verificationTokenExpires: tokenExpiry
+      });
+      
+      // Send verification email
+      await sendVerificationEmail(user.email, verificationToken);
+      
+      res.status(200).json({ message: "Verification email has been sent" });
+    } catch (error) {
+      console.error("Resend verification error:", error);
+      res.status(500).json({ message: "Failed to resend verification email" });
+    }
+  });
+  
+  // Forgot password - request reset
+  app.post("/api/forgot-password", async (req, res) => {
+    try {
+      const { email } = req.body;
+      
+      if (!email) {
+        return res.status(400).json({ message: "Email is required" });
+      }
+      
+      // Find user by email
+      const user = await storage.getUserByEmail(email);
+      
+      if (!user) {
+        // Don't reveal if email exists for security
+        return res.status(200).json({ message: "If your email is registered, you will receive a password reset link" });
+      }
+      
+      // Generate password reset token
+      const resetToken = generatePasswordResetToken();
+      const tokenExpiry = addHours(new Date(), 1); // Token valid for 1 hour
+      
+      // Update user with reset token
+      await storage.updateUserProfile(user.id, {
+        resetPasswordToken: resetToken,
+        resetPasswordTokenExpires: tokenExpiry
+      });
+      
+      // Send password reset email
+      await sendPasswordResetEmail(user.email, resetToken);
+      
+      res.status(200).json({ message: "Password reset email has been sent" });
+    } catch (error) {
+      console.error("Forgot password error:", error);
+      res.status(500).json({ message: "Failed to process password reset request" });
+    }
+  });
+  
+  // Reset password with token
+  app.post("/api/reset-password/:token", async (req, res) => {
+    try {
+      const { token } = req.params;
+      const { password } = req.body;
+      
+      if (!password) {
+        return res.status(400).json({ message: "Password is required" });
+      }
+      
+      // Find user with this reset token
+      const users = await db.select().from(schema.users).where(eq(schema.users.resetPasswordToken, token));
+      
+      if (users.length === 0) {
+        return res.status(400).json({ message: "Invalid or expired reset token" });
+      }
+      
+      const user = users[0];
+      
+      // Check if token has expired
+      if (user.resetPasswordTokenExpires && new Date() > user.resetPasswordTokenExpires) {
+        return res.status(400).json({ message: "Password reset token has expired" });
+      }
+      
+      // Hash new password
+      const saltRounds = 10;
+      const hashedPassword = await bcrypt.hash(password, saltRounds);
+      
+      // Update user password and clear reset token
+      await storage.updateUserProfile(user.id, {
+        password: hashedPassword,
+        resetPasswordToken: null,
+        resetPasswordTokenExpires: null
+      });
+      
+      res.status(200).json({ message: "Password has been reset successfully" });
+    } catch (error) {
+      console.error("Reset password error:", error);
+      res.status(500).json({ message: "Failed to reset password" });
+    }
+  });
+  
+  // Admin check endpoint
+  app.get("/api/admin/check", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Check if user is in the admin list
+      const isAdmin = ADMIN_USERNAMES.includes(user.username);
+      
+      res.json({ 
+        isAdmin,
+        username: user.username 
+      });
+    } catch (error) {
+      console.error('Admin check error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Admin-only voice chat management endpoints
+  
+  // Get active voice channels
+  app.get("/api/admin/voice/channels", authenticateAdmin, async (req, res) => {
+    try {
+      // Get a list of active voice rooms
+      const activeRooms = Array.from(voiceRooms.keys()).map(roomId => {
+        const userCount = voiceRooms.get(roomId)?.size || 0;
+        return {
+          roomId,
+          userCount,
+          createdAt: new Date().toISOString() // We would ideally store this when creating the room
+        };
+      });
+      
+      res.json(activeRooms);
+    } catch (error) {
+      console.error('Error getting voice channels:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Close a voice channel
+  app.post("/api/admin/voice/channels/:roomId/close", authenticateAdmin, async (req, res) => {
+    try {
+      const { roomId } = req.params;
+      const room = voiceRooms.get(roomId);
+      
+      if (!room) {
+        return res.status(404).json({ message: "Voice channel not found" });
+      }
+      
+      // Notify all users in the room that it's being closed
+      room.forEach(clientWs => {
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(JSON.stringify({
+            type: 'voice_channel_closed',
+            payload: {
+              roomId,
+              reason: 'Closed by administrator'
+            }
+          }));
+        }
+      });
+      
+      // Close all connections
+      room.forEach(clientWs => {
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.close();
+        }
+      });
+      
+      // Remove the room
+      voiceRooms.delete(roomId);
+      
+      res.json({ message: "Voice channel closed successfully" });
+    } catch (error) {
+      console.error('Error closing voice channel:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Game routes
+  app.post("/api/games", authenticate, async (req, res) => {
+    try {
+      console.log('Got create game request with body:', req.body);
+      
+      if (!req.body || !req.body.maxPlayers || !req.body.stake) {
+        return res.status(400).json({ message: "Required fields: maxPlayers, stake" });
+      }
+
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+
+      // Validate the request data
+      const validatedData = insertGameSchema.parse({
+        ...req.body,
+        creatorId: req.session.userId,
+        // Calculate commission percentage (10% for stakes less than 50,000, 5% for 50,000 and above)
+        commissionPercentage: req.body.stake >= 50000 ? 0.05 : 0.1
+      });
+      
+      // Special handling for single player (bot) games
+      const isSinglePlayerGame = req.body.playWithBot === true;
+      console.log('Creating game with params:', req.body);
+      
+      // Validate max players (allow 1 for single player bot games)
+      if ((!isSinglePlayerGame && validatedData.maxPlayers < 2) || validatedData.maxPlayers > 10) {
+        return res.status(400).json({ message: "Max players must be between 2 and 10 for multiplayer games" });
+      }
+      
+      // Ensure we set maxPlayers to 2 for bot games (1 human + 1 bot)
+      if (isSinglePlayerGame && validatedData.maxPlayers === 1) {
+        validatedData.maxPlayers = 2;
+      }
+      
+      // IMPORTANT: Add the playWithBot flag from the request body to validatedData
+      if (isSinglePlayerGame) {
+        (validatedData as any).playWithBot = true;
+        console.log('Added playWithBot flag to validatedData');
+      }
+      
+      // Set voice chat enabled based on stake amount (≥₦20,000) or explicit request
+      const HIGH_STAKES_THRESHOLD = 20000;
+      const isHighStakeGame = validatedData.stake >= HIGH_STAKES_THRESHOLD;
+      const voiceChatEnabled = typeof req.body.voiceChatEnabled === 'boolean' 
+        ? req.body.voiceChatEnabled 
+        : isHighStakeGame; // Enable by default for high-stake games
+        
+      console.log('Voice chat', voiceChatEnabled ? 'enabled' : 'disabled', 'for game:', 
+        isHighStakeGame ? 'high-stakes game' : 'user preference');
+      
+      // Cast to proper type using intersection to avoid type errors
+      const gameData = {
+        ...validatedData,
+        voiceChatEnabled, // Use consistent typing - Boolean not null
+        playWithBot: isSinglePlayerGame // Make sure to include this flag properly
+      };
+      
+      console.log(`Voice chat ${voiceChatEnabled ? 'enabled' : 'disabled'} for this game (stake: ${validatedData.stake})`);
+      
+      
+      // Validate stake amount
+      if (validatedData.stake < 1000) {
+        return res.status(400).json({ message: "Minimum stake is ₦1,000" });
+      }
+      
+      // Check if user has enough balance
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      if (user.walletBalance < validatedData.stake) {
+        return res.status(400).json({ message: "Insufficient wallet balance" });
+      }
+      
+      // Create game with the validated data
+      const game = await gameManager.createGame(gameData, req.session.userId);
+      
+      res.status(201).json(game);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0].message });
+      }
+      console.error('Game creation error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.get("/api/games/available", authenticate, async (req, res) => {
+    try {
+      const games = await gameManager.getAvailableGames();
+      res.json(games);
+    } catch (error) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.get("/api/games/user", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const games = await gameManager.getUserGames(req.session.userId);
+      res.json(games);
+    } catch (error) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.get("/api/games/:id", authenticate, async (req, res) => {
+    try {
+      const gameId = parseInt(req.params.id);
+      
+      // Validate game ID
+      if (isNaN(gameId)) {
+        return res.status(400).json({ message: "Invalid game ID" });
+      }
+      
+      // Get game
+      const game = await storage.getGame(gameId);
+      if (!game) {
+        return res.status(404).json({ message: "Game not found" });
+      }
+      
+      // Get players
+      const players = await storage.getGamePlayers(gameId);
+      
+      // Get messages
+      const messages = await storage.getGameMessages(gameId);
+      
+      res.json({
+        game,
+        players,
+        messages
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Send a message in a game
+  app.post("/api/games/:id/messages", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const gameId = parseInt(req.params.id);
+      
+      // Validate game ID
+      if (isNaN(gameId)) {
+        return res.status(400).json({ message: "Invalid game ID" });
+      }
+      
+      // Get game to check if it exists and if user is a player
+      const game = await storage.getGame(gameId);
+      if (!game) {
+        return res.status(404).json({ message: "Game not found" });
+      }
+      
+      // Check if user is a player in this game
+      const gamePlayer = await storage.getGamePlayer(gameId, req.session.userId);
+      if (!gamePlayer) {
+        return res.status(403).json({ message: "You are not a player in this game" });
+      }
+      
+      // Validate message data
+      const messageSchema = z.object({
+        content: z.string().min(1).max(500),
+        type: z.enum(["chat", "system"]).default("chat"),
+      });
+      
+      const validatedData = messageSchema.parse({
+        content: req.body.content,
+        type: req.body.type || "chat",
+      });
+      
+      // Create message
+      const message = await storage.createMessage({
+        gameId,
+        userId: req.session.userId,
+        content: validatedData.content,
+        type: validatedData.type,
+      });
+      
+      // Broadcast message to all game players via WebSocket (if implemented)
+      // This would go here...
+      
+      // Return the created message
+      res.status(201).json(message);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0].message });
+      }
+      console.error('Message creation error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.post("/api/games/:id/join", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+
+      const gameId = parseInt(req.params.id);
+      
+      // Validate game ID
+      if (isNaN(gameId)) {
+        return res.status(400).json({ message: "Invalid game ID" });
+      }
+      
+      // Get game
+      const game = await storage.getGame(gameId);
+      if (!game) {
+        return res.status(404).json({ message: "Game not found" });
+      }
+      
+      // Check if game is waiting for players
+      if (game.status !== "waiting") {
+        return res.status(400).json({ message: "Game is not accepting new players" });
+      }
+      
+      // Check if user has enough balance
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      if (user.walletBalance < game.stake) {
+        return res.status(400).json({ message: "Insufficient wallet balance" });
+      }
+      
+      // Join game
+      await gameManager.joinGame(gameId, req.session.userId);
+      
+      res.json({ message: "Joined game successfully" });
+    } catch (error) {
+      console.error('Error joining game:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Transaction routes
+  // Stripe payment intent endpoint
+  app.post("/api/create-payment-intent", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const { amount } = req.body;
+
+      // Validate amount
+      if (!amount || isNaN(amount) || amount <= 0) {
+        return res.status(400).json({ message: "Invalid amount" });
+      }
+
+      // Create a payment intent with Stripe
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: Math.round(amount * 100), // Convert to cents/kobo
+        currency: "ngn", // Nigerian Naira
+        automatic_payment_methods: {
+          enabled: true,
+        },
+        // Store user ID in metadata for reference
+        metadata: {
+          userId: req.session.userId.toString(),
+        },
+      });
+
+      // Return the client secret to the client
+      res.json({ clientSecret: paymentIntent.client_secret });
+    } catch (error) {
+      console.error("Error creating payment intent:", error);
+      res.status(500).json({ 
+        message: "Failed to create payment intent", 
+        error: error instanceof Error ? error.message : "Unknown error" 
+      });
+    }
+  });
+
+  // Stripe webhook endpoint to handle successful payments
+  app.post("/api/stripe-webhook", async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    
+    // For demo purposes, we'll skip signature verification
+    // In production, you should verify the signature
+    
+    try {
+      const event = req.body;
+      
+      if (event.type === 'payment_intent.succeeded') {
+        const paymentIntent = event.data.object;
+        
+        // Get the user ID from metadata
+        const userId = parseInt(paymentIntent.metadata.userId);
+        
+        // Get payment amount in currency (Naira)
+        const amount = paymentIntent.amount / 100;
+        
+        // Create transaction record
+        const transaction = await storage.createTransaction({
+          userId,
+          amount,
+          type: "deposit",
+          status: "completed",
+          reference: paymentIntent.id,
+        });
+        
+        // Update user balance
+        const user = await storage.getUser(userId);
+        if (user) {
+          await storage.updateUserBalance(
+            userId,
+            user.walletBalance + amount
+          );
+        }
+      }
+      
+      res.json({ received: true });
+    } catch (error) {
+      console.error('Webhook error:', error);
+      return res.status(400).send(`Webhook Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  });
+
+  // Legacy deposit endpoint for demo/simulated deposits
+  app.post("/api/transactions/deposit", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const { amount, usePaystack } = req.body;
+      
+      // Validate amount
+      if (!amount || isNaN(amount) || amount <= 0) {
+        return res.status(400).json({ message: "Invalid amount" });
+      }
+      
+      // Get user for email (needed for Paystack)
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      // If using Paystack for real payment, initialize payment
+      if (usePaystack && user.email) {
+        const paymentResult = await paymentProcessing.processDeposit(
+          req.session.userId, 
+          amount, 
+          user.email
+        );
+        
+        if (!paymentResult.success) {
+          return res.status(400).json({ message: paymentResult.message });
+        }
+        
+        // If Paystack payment was initialized, return authorization URL
+        if (paymentResult.authorizationUrl) {
+          return res.json({
+            success: true,
+            authorizationUrl: paymentResult.authorizationUrl,
+            reference: paymentResult.reference,
+            message: "Payment initialized. Redirect to the authorization URL to complete payment."
+          });
+        }
+      }
+      
+      // If not using Paystack or using quick deposit fallback
+      const paymentResult = await paymentProcessing.processDeposit(
+        req.session.userId, 
+        amount
+      );
+      
+      if (!paymentResult.success) {
+        return res.status(400).json({ message: paymentResult.message });
+      }
+      
+      // Create transaction
+      const transaction = await storage.createTransaction({
+        userId: req.session.userId,
+        amount,
+        type: "deposit",
+        status: "completed",
+        reference: paymentResult.reference,
+        currency: "NGN",
+        description: `Quick deposit of ${amount} NGN`,
+        paymentMethod: "quick_deposit",
+        paymentDetails: { source: "demo" }
+      });
+      
+      // Update user balance
+      const updatedUser = await storage.updateUserBalance(
+        req.session.userId,
+        user.walletBalance + amount
+      );
+      
+      res.json({
+        transaction,
+        newBalance: updatedUser.walletBalance
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Demo deposit (for testing only)
+  app.post("/api/transactions/demo-deposit", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const amount = 100000; // ₦100,000 demo amount
+      
+      // Create transaction
+      const transaction = await storage.createTransaction({
+        userId: req.session.userId,
+        amount,
+        type: "deposit",
+        status: "completed",
+        reference: `demo-${Date.now()}`,
+      });
+      
+      // Update user balance
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      const updatedUser = await storage.updateUserBalance(
+        req.session.userId,
+        user.walletBalance + amount
+      );
+      
+      res.json({
+        transaction,
+        newBalance: updatedUser.walletBalance,
+        message: "Demo funds added successfully"
+      });
+    } catch (error) {
+      console.error('Demo deposit error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.post("/api/transactions/withdraw", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const { amount, bankCode, accountNumber, accountName, usePaystack } = req.body;
+      
+      // Validate amount
+      if (!amount || isNaN(amount) || amount <= 0) {
+        return res.status(400).json({ message: "Invalid amount" });
+      }
+      
+      // Check if user has enough balance
+      const user = await storage.getUser(req.session.userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+      
+      if (user.walletBalance < amount) {
+        return res.status(400).json({ message: "Insufficient wallet balance" });
+      }
+      
+      let withdrawalResult;
+      
+      // If using Paystack for real transfers, verify bank details first
+      if (usePaystack && bankCode && accountNumber) {
+        const bankDetails = {
+          accountNumber,
+          bankCode,
+          accountName
+        };
+        
+        // Process withdrawal using Paystack
+        withdrawalResult = await paymentProcessing.processWithdrawal(
+          req.session.userId, 
+          amount, 
+          bankDetails
+        );
+        
+        if (!withdrawalResult.success) {
+          return res.status(400).json({ message: withdrawalResult.message });
+        }
+        
+        // Create pending transaction for Paystack withdrawal
+        const transaction = await storage.createTransaction({
+          userId: req.session.userId,
+          amount,
+          type: "withdrawal",
+          status: "pending", // Set to pending initially, will be updated on webhook callback
+          reference: withdrawalResult.reference,
+          currency: "NGN",
+          withdrawalMethod: "bank_transfer",
+          bankDetails: bankDetails,
+          paymentDetails: { provider: "paystack" }
+        });
+        
+        // Update user balance immediately to prevent double spending
+        const updatedUser = await storage.updateUserBalance(
+          req.session.userId,
+          user.walletBalance - amount
+        );
+        
+        return res.json({
+          transaction,
+          newBalance: updatedUser.walletBalance,
+          message: "Withdrawal initiated. You will be notified once processed."
+        });
+      }
+      
+      // Fallback to demo withdrawal when not using Paystack
+      withdrawalResult = await paymentProcessing.processWithdrawal(
+        req.session.userId, 
+        amount
+      );
+      
+      if (!withdrawalResult.success) {
+        return res.status(400).json({ message: withdrawalResult.message });
+      }
+      
+      // Create transaction for demo withdrawal
+      const transaction = await storage.createTransaction({
+        userId: req.session.userId,
+        amount,
+        type: "withdrawal",
+        status: "completed",
+        reference: withdrawalResult.reference,
+        currency: "NGN",
+        description: `Withdrawal of ${amount} NGN to bank account`
+      });
+      
+      // Update user balance
+      const updatedUser = await storage.updateUserBalance(
+        req.session.userId,
+        user.walletBalance - amount
+      );
+      
+      res.json({
+        transaction,
+        newBalance: updatedUser.walletBalance
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.get("/api/transactions", authenticate, async (req, res) => {
+    try {
+      // Since authenticate middleware ensures userId exists, we can safely use the type guard
+      ensureUserIdExists(req.session.userId);
+      
+      const transactions = await storage.getUserTransactions(req.session.userId);
+      res.json(transactions);
+    } catch (error) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Parse sessions from WebSocket upgrade requests
+  wss.on('headers', (headers, req) => {
+    headers.push('Set-Cookie: ' + req.headers.cookie);
+  });
+  
+  // WebSocket connection handling
+  wss.on('connection', (ws, req) => {
+    let userId: number | null = null;
+    let gameId: number | null = null;
+    
+    // Extract session and session data
+    const getSessionData = () => {
+      return new Promise<number | null>((resolve) => {
+        sessionMiddleware(req as any, {} as any, () => {
+          if ((req as any).session && (req as any).session.userId) {
+            resolve((req as any).session.userId);
+          } else {
+            resolve(null);
+          }
+        });
+      });
+    };
+    
+    // Initial authentication
+    getSessionData().then(sessionUserId => {
+      if (sessionUserId) {
+        userId = sessionUserId;
+        console.log(`WebSocket authenticated for user ${userId}`);
+      }
+    });
+    
+    ws.on('message', async (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+        
+        // Handle voice chat messages
+        if (data.type === 'join_voice') {
+          const roomId = data.payload.roomId;
+          const peerId = data.payload.peerId;
+          
+          console.log(`Voice chat: User ${peerId} joined room ${roomId}`);
+          
+          // Store these voice connections in a separate map from the game connections
+          if (!voiceRooms.has(roomId)) {
+            voiceRooms.set(roomId, new Map());
+          }
+          
+          // Add this connection to voice room
+          const room = voiceRooms.get(roomId);
+          if (room) {
+            room.set(peerId, ws);
+            
+            // Notify other users in the room about the new join
+            room.forEach((peerWs, peerPeerId) => {
+              if (peerPeerId !== peerId && peerWs.readyState === WebSocket.OPEN) {
+                peerWs.send(JSON.stringify({
+                  type: 'voice_user_joined',
+                  payload: { roomId, peerId }
+                }));
+              }
+            });
+            
+            // Confirm join to the user
+            ws.send(JSON.stringify({
+              type: 'voice_joined',
+              payload: { roomId, peerId }
+            }));
+          }
+          return;
+        }
+        
+        // Handle WebRTC signaling messages for voice chat
+        if (data.type === 'voice_offer' || data.type === 'voice_answer' || data.type === 'voice_ice_candidate') {
+          const { roomId, peerId, targetPeerId } = data.payload;
+          
+          // Find the target peer in the room
+          const room = voiceRooms.get(roomId);
+          if (room && targetPeerId) {
+            const targetWs = room.get(targetPeerId);
+            if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+              // Forward the signaling message to the target peer
+              targetWs.send(JSON.stringify(data));
+              console.log(`Voice chat: Forwarded ${data.type} from ${peerId} to ${targetPeerId}`);
+            }
+          }
+          return;
+        }
+        
+        // Handle simple voice chat audio data
+        if (data.type === 'voice_data') {
+          const { roomId, peerId } = data.payload;
+          
+          // Find all peers in the room
+          const room = voiceRooms.get(roomId);
+          if (room) {
+            // Broadcast to all other peers in the room
+            room.forEach((peerWs, peerKey) => {
+              if (peerKey !== peerId && peerWs.readyState === WebSocket.OPEN) {
+                // Forward the audio data to other peers
+                peerWs.send(JSON.stringify(data));
+              }
+            });
+            console.log(`Voice chat: Broadcast voice data from ${peerId} to ${room.size - 1} peers`);
+          }
+          return;
+        }
+        
+        // Handle voice chat leave
+        if (data.type === 'voice_leave') {
+          const { roomId, peerId } = data.payload;
+          
+          const room = voiceRooms.get(roomId);
+          if (room) {
+            // Remove this connection from the room
+            room.delete(peerId);
+            
+            // Notify others in the room
+            room.forEach((peerWs, peerPeerId) => {
+              if (peerWs.readyState === WebSocket.OPEN) {
+                peerWs.send(JSON.stringify({
+                  type: 'voice_user_left',
+                  payload: { roomId, peerId }
+                }));
+              }
+            });
+            
+            // If room is empty, remove it
+            if (room.size === 0) {
+              voiceRooms.delete(roomId);
+            }
+          }
+          
+          console.log(`Voice chat: User ${peerId} left room ${roomId}`);
+          return;
+        }
+        
+        // Game-related messages
+        if (data.type === 'join_game') {
+          gameId = data.payload.gameId;
+          
+          // If we don't have a userId yet, try to get from the session
+          if (!userId) {
+            userId = await getSessionData();
+          }
+          
+          // Check if we have a valid user
+          if (!userId) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              payload: {
+                message: 'Unauthorized - please login again'
+              }
+            }));
+            return;
+          }
+          
+          // Add the connection to game manager
+          if (gameId !== null && userId !== null) {
+            // We've verified both are non-null, so it's safe to assert them as numbers
+            gameManager.addWebSocketConnection(gameId as number, userId as number, ws);
+          }
+          
+          // Log
+          console.log(`User ${userId} joined game ${gameId}`);
+        } else if (data.type === 'leave_game') {
+          if (gameId !== null && userId !== null) {
+            gameManager.removeWebSocketConnection(gameId as number, userId as number);
+            gameId = null;
+          }
+        } else if (data.type === 'roll_stone') {
+          if (gameId !== null && userId !== null) {
+            await gameManager.rollStone(gameId as number, userId as number);
+            console.log(`User ${userId} rolled in game ${gameId}`);
+          } else {
+            console.log('Cannot roll: missing gameId or userId', { gameId, userId });
+            
+            // Try to re-authenticate
+            if (!userId) {
+              userId = await getSessionData();
+              
+              if (userId !== null && gameId !== null) {
+                await gameManager.rollStone(gameId as number, userId as number);
+                console.log(`Re-authenticated user ${userId} rolled in game ${gameId}`);
+              }
+            }
+          }
+        } else if (data.type === 'chat_message') {
+          if (gameId !== null && userId !== null) {
+            const messageContent = data.payload.content;
+            
+            // Validate message
+            if (!messageContent || messageContent.trim() === '') {
+              return;
+            }
+            
+            // Create and broadcast message
+            await gameManager.sendChatMessage(gameId as number, userId as number, messageContent);
+          }
+        } 
+        // Handle WebRTC signaling for voice chat
+        else if (['voice_offer', 'voice_answer', 'voice_ice_candidate', 'voice_leave'].includes(data.type)) {
+          if (gameId !== null && userId !== null) {
+            // Get the game to check if voice chat is enabled
+            const game = await storage.getGame(gameId as number);
+            if (!game) {
+              return;
+            }
+            
+            // Only relay voice chat messages if the game has voice chat enabled
+            // Voice chat is enabled for games with stake >= 20,000
+            if (game.voiceChatEnabled) {
+              // The target user ID to send the signaling message to
+              const targetUserId = data.payload.targetUserId;
+              
+              if (!targetUserId) {
+                return;
+              }
+              
+              // Find the target connection
+              const connections = gameManager.getGameConnections(gameId as number);
+              const targetConnection = connections.find(conn => conn.userId === targetUserId);
+              
+              // Send the signaling message directly to the target user
+              if (targetConnection && targetConnection.ws.readyState === WebSocket.OPEN) {
+                targetConnection.ws.send(JSON.stringify({
+                  type: data.type,
+                  payload: {
+                    ...data.payload,
+                    fromUserId: userId
+                  }
+                }));
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('WebSocket error:', error);
+      }
+    });
+    
+    ws.on('close', () => {
+      if (gameId && userId) {
+        gameManager.removeWebSocketConnection(gameId, userId);
+      }
+    });
+  });
+  
+  // Admin Users endpoint
+  app.get("/api/admin/users", authenticateAdmin, async (req, res) => {
+    try {
+      const users = await storage.getAllUsers();
+      res.json(users);
+    } catch (error) {
+      console.error("Error fetching users for admin:", error);
+      res.status(500).json({ message: "Error fetching users" });
+    }
+  });
+  
+  // Admin - Get single user details
+  app.get("/api/admin/users/:userId", authenticateAdmin, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+      
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Get user's transactions
+      const transactions = await storage.getUserTransactions(userId);
+      
+      // Get user's games
+      const games = await storage.getUserGames(userId);
+      
+      // Add avatarInitials if not present
+      if (!user.avatarInitials) {
+        user.avatarInitials = user.username.substring(0, 2).toUpperCase();
+      }
+      
+      // Add isActive field for admin UI
+      const userWithStatus = {
+        ...user,
+        isActive: true,  // Default to active for now
+      };
+      
+      res.json({
+        user: userWithStatus,
+        transactions,
+        games
+      });
+    } catch (error) {
+      console.error(`Error fetching user details for admin: ${error}`);
+      res.status(500).json({ message: "Error fetching user details" });
+    }
+  });
+  
+  // Admin - Update user status (activate/deactivate)
+  app.patch("/api/admin/users/:userId/status", authenticateAdmin, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+      
+      const { isActive } = req.body;
+      if (typeof isActive !== 'boolean') {
+        return res.status(400).json({ message: "Invalid status value" });
+      }
+      
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Update user profile with isActive status
+      const updatedUser = await storage.updateUserProfile(userId, { 
+        ...user, 
+        isActive 
+      });
+      
+      res.json(updatedUser);
+    } catch (error) {
+      console.error(`Error updating user status for admin: ${error}`);
+      res.status(500).json({ message: "Error updating user status" });
+    }
+  });
+  
+  // Admin - Update user balance
+  app.post("/api/admin/users/:userId/balance", authenticateAdmin, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+      
+      const { amount, reason } = req.body;
+      if (typeof amount !== 'number') {
+        return res.status(400).json({ message: "Amount must be a number" });
+      }
+      
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Calculate new balance
+      const newBalance = user.walletBalance + amount;
+      if (newBalance < 0) {
+        return res.status(400).json({ message: "Insufficient balance for deduction" });
+      }
+      
+      // Update user balance
+      const updatedUser = await storage.updateUserBalance(userId, newBalance);
+      
+      // Create transaction record
+      const transactionType = amount >= 0 ? 'deposit' : 'withdrawal';
+      const transaction = await storage.createTransaction({
+        userId,
+        type: transactionType,
+        amount: Math.abs(amount),  // Store as positive amount
+        status: 'completed',
+        currency: 'NGN',  // Default currency
+        description: reason || `Manual ${transactionType} by admin`,
+        reference: `admin-adjustment-${Date.now()}`
+      });
+      
+      res.json({
+        user: updatedUser,
+        transaction
+      });
+    } catch (error) {
+      console.error(`Error adjusting user balance for admin: ${error}`);
+      res.status(500).json({ message: "Error adjusting user balance" });
+    }
+  });
+    } catch (error) {
+      console.error(`Error fetching user details for admin: ${error}`);
+      res.status(500).json({ message: "Error fetching user details" });
+    }
+  });
+  
+  // Admin - Update user status (activate/deactivate)
+  app.patch("/api/admin/users/:userId/status", authenticateAdmin, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+      
+      const { isActive } = req.body;
+      if (typeof isActive !== 'boolean') {
+        return res.status(400).json({ message: "isActive must be a boolean value" });
+      }
+      
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Prevent deactivating the current admin user
+      if (user.id === req.user?.id && !isActive) {
+        return res.status(400).json({ message: "You cannot deactivate your own account" });
+      }
+      
+      const updatedUser = await storage.updateUserProfile(userId, { isActive });
+      
+      res.json({
+        message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
+        user: updatedUser
+      });
+    } catch (error) {
+      console.error(`Error updating user status for admin: ${error}`);
+      res.status(500).json({ message: "Error updating user status" });
+    }
+  });
+  
+  // Admin - Adjust user balance
+  app.patch("/api/admin/users/:userId/balance", authenticateAdmin, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.userId);
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "Invalid user ID" });
+      }
+      
+      const { amount, reason } = req.body;
+      if (typeof amount !== 'number' || isNaN(amount)) {
+        return res.status(400).json({ message: "Amount must be a valid number" });
+      }
+      
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Calculate new balance
+      const newBalance = user.walletBalance + amount;
+      if (newBalance < 0) {
+        return res.status(400).json({ message: "Balance adjustment would result in negative balance" });
+      }
+      
+      // Update user balance
+      const updatedUser = await storage.updateUserBalance(userId, newBalance);
+      
+      // Create transaction record
+      const transactionType = amount > 0 ? 'deposit' : 'withdrawal';
+      const transaction = await storage.createTransaction({
+        userId,
+        type: transactionType,
+        amount: Math.abs(amount),
+        status: 'completed',
+        currency: user.preferredCurrency || 'NGN',
+        description: reason || `Manual balance adjustment by admin (${req.user?.username})`,
+        reference: `admin-${Date.now()}`
+      });
+      
+      res.json({
+        message: `User balance updated successfully`,
+        user: updatedUser,
+        transaction
+      });
+    } catch (error) {
+      console.error(`Error adjusting user balance for admin: ${error}`);
+      res.status(500).json({ message: "Error adjusting user balance" });
+    }
+  });
+  
+  // Admin Games endpoint
+  app.get("/api/admin/games", authenticateAdmin, async (req, res) => {
+    try {
+      const games = await storage.getGames();
+      res.json(games);
+    } catch (error) {
+      console.error("Error fetching games for admin:", error);
+      res.status(500).json({ message: "Error fetching games" });
+    }
+  });
+  
+  // Admin - Get single game details
+  app.get("/api/admin/games/:gameId", authenticateAdmin, async (req, res) => {
+    try {
+      const gameId = parseInt(req.params.gameId);
+      if (isNaN(gameId)) {
+        return res.status(400).json({ message: "Invalid game ID" });
+      }
+      
+      const game = await storage.getGame(gameId);
+      if (!game) {
+        return res.status(404).json({ message: "Game not found" });
+      }
+      
+      // Get all players in the game
+      const players = await storage.getGamePlayers(gameId);
+      
+      // Get game messages
+      const messages = await storage.getGameMessages(gameId);
+      
+      res.json({
+        game,
+        players,
+        messages
+      });
+    } catch (error) {
+      console.error(`Error fetching game details for admin: ${error}`);
+      res.status(500).json({ message: "Error fetching game details" });
+    }
+  });
+  
+  // Admin - Force end a game
+  app.post("/api/admin/games/:gameId/end", authenticateAdmin, async (req, res) => {
+    try {
+      const gameId = parseInt(req.params.gameId);
+      if (isNaN(gameId)) {
+        return res.status(400).json({ message: "Invalid game ID" });
+      }
+      
+      const game = await storage.getGame(gameId);
+      if (!game) {
+        return res.status(404).json({ message: "Game not found" });
+      }
+      
+      if (game.status === 'completed') {
+        return res.status(400).json({ message: "Game is already completed" });
+      }
+      
+      // Get all players in the game
+      const players = await storage.getGamePlayers(gameId);
+      
+      // Decide what to do based on game state
+      if (game.status === 'waiting') {
+        // For waiting games, refund all player stakes
+        for (const player of players) {
+          if (player.user && player.isActive) {
+            // Refund the stake to player's wallet
+            const user = await storage.getUser(player.userId);
+            if (user) {
+              const newBalance = user.walletBalance + game.stake;
+              await storage.updateUserBalance(player.userId, newBalance);
+              
+              // Create refund transaction
+              await storage.createTransaction({
+                userId: player.userId,
+                type: 'refund',
+                amount: game.stake,
+                status: 'completed',
+                currency: game.currency,
+                description: `Refund for game #${gameId} terminated by admin`,
+                reference: `admin-refund-${Date.now()}-${player.userId}`
+              });
+            }
+          }
+        }
+        
+        // Update game status
+        const updatedGame = await storage.updateGameStatus(gameId, 'completed');
+        
+        return res.json({
+          message: "Game terminated and all stakes refunded",
+          game: updatedGame
+        });
+      } else if (game.status === 'in_progress') {
+        // For in-progress games, determine if there are any valid rolls
+        // Find highest roll if any
+        let highestRoll = -1;
+        let winnerIds: number[] = [];
+        
+        players.forEach(player => {
+          if (player.hasRolled && player.rolledNumber !== null && player.isActive) {
+            if (player.rolledNumber > highestRoll) {
+              highestRoll = player.rolledNumber;
+              winnerIds = [player.userId];
+            } else if (player.rolledNumber === highestRoll) {
+              winnerIds.push(player.userId);
+            }
+          }
+        });
+        
+        if (winnerIds.length > 0 && highestRoll > 0) {
+          // There are winners, split the pot
+          const updatedGame = await storage.updateGameWinners(gameId, winnerIds, highestRoll);
+          
+          return res.json({
+            message: `Game force-ended. Winnings distributed to ${winnerIds.length} player(s)`,
+            game: updatedGame,
+            winners: winnerIds,
+            winningNumber: highestRoll
+          });
+        } else {
+          // No valid rolls, refund everyone
+          for (const player of players) {
+            if (player.user && player.isActive) {
+              // Refund the stake to player's wallet
+              const user = await storage.getUser(player.userId);
+              if (user) {
+                const newBalance = user.walletBalance + game.stake;
+                await storage.updateUserBalance(player.userId, newBalance);
+                
+                // Create refund transaction
+                await storage.createTransaction({
+                  userId: player.userId,
+                  type: 'refund',
+                  amount: game.stake,
+                  status: 'completed',
+                  currency: game.currency,
+                  description: `Refund for game #${gameId} terminated by admin`,
+                  reference: `admin-refund-${Date.now()}-${player.userId}`
+                });
+              }
+            }
+          }
+          
+          // Update game status
+          const updatedGame = await storage.updateGameStatus(gameId, 'completed');
+          
+          return res.json({
+            message: "Game terminated and all stakes refunded",
+            game: updatedGame
+          });
+        }
+      }
+      
+      res.status(400).json({ message: "Invalid game state" });
+    } catch (error) {
+      console.error(`Error force-ending game for admin: ${error}`);
+      res.status(500).json({ message: "Error force-ending game" });
+    }
+  });
+  
+  // Admin Transactions endpoint
+  app.get("/api/admin/transactions", authenticateAdmin, async (req, res) => {
+    try {
+      // Get all users first
+      const users = await storage.getAllUsers();
+      
+      // Get transactions for each user and combine them
+      const allTransactionsPromises = users.map(user => storage.getUserTransactions(user.id));
+      const transactionsByUser = await Promise.all(allTransactionsPromises);
+      
+      // Flatten the array of transaction arrays
+      const allTransactions = transactionsByUser.flat();
+      
+      // Sort by createdAt descending
+      allTransactions.sort((a, b) => {
+        const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return dateB - dateA;
+      });
+      
+      res.json(allTransactions);
+    } catch (error) {
+      console.error("Error fetching transactions for admin:", error);
+      res.status(500).json({ message: "Error fetching transactions" });
+    }
+  });
+  
+  // Admin - Get single transaction details
+  app.get("/api/admin/transactions/:transactionId", authenticateAdmin, async (req, res) => {
+    try {
+      const transactionId = parseInt(req.params.transactionId);
+      if (isNaN(transactionId)) {
+        return res.status(400).json({ message: "Invalid transaction ID" });
+      }
+      
+      const transaction = await storage.getTransaction(transactionId);
+      if (!transaction) {
+        return res.status(404).json({ message: "Transaction not found" });
+      }
+      
+      // Get user details
+      const user = await storage.getUser(transaction.userId);
+      
+      res.json({
+        transaction,
+        user
+      });
+    } catch (error) {
+      console.error(`Error fetching transaction details for admin: ${error}`);
+      res.status(500).json({ message: "Error fetching transaction details" });
+    }
+  });
+  
+  // Admin - Update transaction status (for approving/rejecting withdrawals)
+  app.patch("/api/admin/transactions/:transactionId/status", authenticateAdmin, async (req, res) => {
+    try {
+      const transactionId = parseInt(req.params.transactionId);
+      if (isNaN(transactionId)) {
+        return res.status(400).json({ message: "Invalid transaction ID" });
+      }
+      
+      const { status, reason } = req.body;
+      if (!['pending', 'completed', 'failed', 'disputed'].includes(status)) {
+        return res.status(400).json({ message: "Invalid status value" });
+      }
+      
+      const transaction = await storage.getTransaction(transactionId);
+      if (!transaction) {
+        return res.status(404).json({ message: "Transaction not found" });
+      }
+      
+      // Handle withdrawal approvals/rejections specifically
+      if (transaction.type === 'withdrawal') {
+        const user = await storage.getUser(transaction.userId);
+        if (!user) {
+          return res.status(404).json({ message: "User not found" });
+        }
+        
+        // If previously pending and now completed, nothing to do (funds already deducted)
+        // If previously pending and now failed/disputed, return funds to user
+        if (transaction.status === 'pending' && (status === 'failed' || status === 'disputed')) {
+          // Return funds to user
+          const newBalance = user.walletBalance + transaction.amount;
+          await storage.updateUserBalance(transaction.userId, newBalance);
+          
+          // Add a note to the transaction
+          const updatedTransaction = await storage.updateTransactionStatus(
+            transactionId, 
+            status,
+            reason || `Withdrawal ${status} by admin (${req.user?.username})`
+          );
+          
+          return res.json({
+            message: `Withdrawal rejected and funds returned to user`,
+            transaction: updatedTransaction,
+            user: {
+              id: user.id,
+              username: user.username,
+              walletBalance: newBalance
+            }
+          });
+        }
+      }
+      
+      // For all other cases, just update the status
+      const updatedTransaction = await storage.updateTransactionStatus(
+        transactionId, 
+        status, 
+        reason || `Status updated by admin (${req.user?.username})`
+      );
+      
+      res.json({
+        message: `Transaction status updated to ${status}`,
+        transaction: updatedTransaction
+      });
+    } catch (error) {
+      console.error(`Error updating transaction status for admin: ${error}`);
+      res.status(500).json({ message: "Error updating transaction status" });
+    }
+  });
+  
+  // Admin - Get pending withdrawals
+  app.get("/api/admin/withdrawals/pending", authenticateAdmin, async (req, res) => {
+    try {
+      // Get all users first
+      const users = await storage.getAllUsers();
+      
+      // Get transactions for each user and combine them
+      const allTransactionsPromises = users.map(user => storage.getUserTransactions(user.id));
+      const transactionsByUser = await Promise.all(allTransactionsPromises);
+      
+      // Flatten the array of transaction arrays
+      const allTransactions = transactionsByUser.flat();
+      
+      // Filter pending withdrawals
+      const pendingWithdrawals = allTransactions.filter(tx => 
+        tx.type === 'withdrawal' && tx.status === 'pending'
+      );
+      
+      // Get user details for each withdrawal
+      const withdrawalsWithUserDetails = await Promise.all(
+        pendingWithdrawals.map(async (withdrawal) => {
+          const user = await storage.getUser(withdrawal.userId);
+          return {
+            ...withdrawal,
+            user: user ? {
+              id: user.id,
+              username: user.username,
+              email: user.email
+            } : null
+          };
+        })
+      );
+      
+      res.json(withdrawalsWithUserDetails);
+    } catch (error) {
+      console.error("Error fetching pending withdrawals for admin:", error);
+      res.status(500).json({ message: "Error fetching pending withdrawals" });
+    }
+  });
+  
+  // Admin Game Statistics endpoint
+  app.get("/api/admin/statistics/games", authenticateAdmin, async (req, res) => {
+    try {
+      const { period = "week" } = req.query;
+      
+      // Get all games with error handling
+      let games = [];
+      try {
+        games = await storage.getGames();
+      } catch (err) {
+        console.error("Failed to fetch games:", err);
+        games = []; // Fallback to empty array
+      }
+      
+      // Calculate date range based on period
+      const today = new Date();
+      let startDate = new Date();
+      
+      switch (period) {
+        case 'day':
+          startDate.setDate(today.getDate() - 1);
+          break;
+        case 'week':
+          startDate.setDate(today.getDate() - 7);
+          break;
+        case 'month':
+          startDate.setMonth(today.getMonth() - 1);
+          break;
+        case 'year':
+          startDate.setFullYear(today.getFullYear() - 1);
+          break;
+        default:
+          startDate.setDate(today.getDate() - 7); // Default to week
+      }
+      
+      // Filter games in period (safely)
+      const gamesInPeriod = games.filter(game => {
+        if (!game || !game.createdAt) return false;
+        try {
+          return new Date(game.createdAt) >= startDate;
+        } catch (e) {
+          console.error("Error parsing date:", e);
+          return false;
+        }
+      });
+      
+      // Calculate statistics
+      const totalGames = gamesInPeriod.length;
+      const gamesWaiting = gamesInPeriod.filter(g => g.status === 'waiting').length;
+      const gamesInProgress = gamesInPeriod.filter(g => g.status === 'in_progress').length;
+      const gamesCompleted = gamesInPeriod.filter(g => g.status === 'completed').length;
+      
+      // Group games by day for chart data
+      const gamesByDay = {};
+      
+      // Initialize all days in the period with 0 games
+      for (let d = new Date(startDate); d <= today; d.setDate(d.getDate() + 1)) {
+        const dateStr = d.toISOString().split('T')[0];
+        gamesByDay[dateStr] = 0;
+      }
+      
+      // Count games per day (safely)
+      gamesInPeriod.forEach(game => {
+        if (game && game.createdAt) {
+          try {
+            const dateStr = new Date(game.createdAt).toISOString().split('T')[0];
+            gamesByDay[dateStr] = (gamesByDay[dateStr] || 0) + 1;
+          } catch (e) {
+            console.error("Error processing game date:", e);
+          }
+        }
+      });
+      
+      // Format for chart data
+      const chartData = Object.entries(gamesByDay).map(([date, count]) => ({
+        date,
+        count
+      }));
+      
+      res.json({
+        totalGames,
+        gamesWaiting,
+        gamesInProgress,
+        gamesCompleted,
+        chartData,
+        period
+      });
+    } catch (error) {
+      console.error("Error fetching game statistics:", error);
+      res.status(500).json({ 
+        message: "Error fetching game statistics",
+        totalGames: 0,
+        gamesWaiting: 0,
+        gamesInProgress: 0,
+        gamesCompleted: 0,
+        chartData: [],
+        period: req.query.period || "week"
+      });
+    }
+  });
+  
+  // Admin Financial Statistics endpoint
+  app.get("/api/admin/statistics/financial", authenticateAdmin, async (req, res) => {
+    try {
+      const { period = "week" } = req.query;
+      
+      // Get all users with error handling
+      let users = [];
+      try {
+        users = await storage.getAllUsers();
+      } catch (err) {
+        console.error("Failed to fetch users for financial statistics:", err);
+        users = []; // Fallback to empty array
+      }
+      
+      // Get all transactions for all users with error handling
+      let allTransactions = [];
+      try {
+        const usersTransactionsPromises = users.map(user => storage.getUserTransactions(user.id));
+        const transactionsByUser = await Promise.all(usersTransactionsPromises);
+        allTransactions = transactionsByUser.flat();
+      } catch (err) {
+        console.error("Failed to fetch transactions for financial statistics:", err);
+        allTransactions = []; // Fallback to empty array
+      }
+      
+      // Calculate date range based on period
+      const today = new Date();
+      let startDate = new Date();
+      
+      switch (period) {
+        case 'day':
+          startDate.setDate(today.getDate() - 1);
+          break;
+        case 'week':
+          startDate.setDate(today.getDate() - 7);
+          break;
+        case 'month':
+          startDate.setMonth(today.getMonth() - 1);
+          break;
+        case 'year':
+          startDate.setFullYear(today.getFullYear() - 1);
+          break;
+        default:
+          startDate.setDate(today.getDate() - 7); // Default to week
+      }
+      
+      // Filter transactions in period (safely)
+      const transactionsInPeriod = allTransactions.filter(tx => {
+        if (!tx || !tx.createdAt) return false;
+        try {
+          return new Date(tx.createdAt) >= startDate;
+        } catch (e) {
+          console.error("Error parsing transaction date:", e);
+          return false;
+        }
+      });
+      
+      // Calculate financial metrics (safely)
+      const totalDeposits = transactionsInPeriod
+        .filter(t => t && t.type === 'deposit' && t.status === 'completed')
+        .reduce((sum, t) => sum + (t.amount || 0), 0);
+        
+      const totalWithdrawals = transactionsInPeriod
+        .filter(t => t && t.type === 'withdrawal' && t.status === 'completed')
+        .reduce((sum, t) => sum + (t.amount || 0), 0);
+        
+      const totalFees = transactionsInPeriod
+        .filter(t => t && t.type === 'commission' && t.status === 'completed')
+        .reduce((sum, t) => sum + (t.amount || 0), 0);
+        
+      const totalGameStakes = transactionsInPeriod
+        .filter(t => t && t.type === 'stake' && t.status === 'completed')
+        .reduce((sum, t) => sum + (t.amount || 0), 0);
+        
+      const totalGameWinnings = transactionsInPeriod
+        .filter(t => t && t.type === 'winnings' && t.status === 'completed')
+        .reduce((sum, t) => sum + (t.amount || 0), 0);
+      
+      // Group transactions by day for chart data
+      const depositsByDay = {};
+      const withdrawalsByDay = {};
+      const feesByDay = {};
+      
+      // Initialize all days in the period
+      for (let d = new Date(startDate); d <= today; d.setDate(d.getDate() + 1)) {
+        const dateStr = d.toISOString().split('T')[0];
+        depositsByDay[dateStr] = 0;
+        withdrawalsByDay[dateStr] = 0;
+        feesByDay[dateStr] = 0;
+      }
+      
+      // Calculate daily totals (safely)
+      transactionsInPeriod.forEach(tx => {
+        if (!tx || tx.status !== 'completed' || !tx.createdAt) return;
+        
+        try {
+          const dateStr = new Date(tx.createdAt).toISOString().split('T')[0];
+          
+          if (tx.type === 'deposit') {
+            depositsByDay[dateStr] = (depositsByDay[dateStr] || 0) + (tx.amount || 0);
+          } else if (tx.type === 'withdrawal') {
+            withdrawalsByDay[dateStr] = (withdrawalsByDay[dateStr] || 0) + (tx.amount || 0);
+          } else if (tx.type === 'commission') {
+            feesByDay[dateStr] = (feesByDay[dateStr] || 0) + (tx.amount || 0);
+          }
+        } catch (e) {
+          console.error("Error processing transaction for chart data:", e);
+        }
+      });
+      
+      // Format for chart data
+      const chartData = Object.keys(depositsByDay).map(date => ({
+        date,
+        deposits: depositsByDay[date] || 0,
+        withdrawals: withdrawalsByDay[date] || 0,
+        fees: feesByDay[date] || 0
+      }));
+      
+      res.json({
+        totalDeposits,
+        totalWithdrawals,
+        totalFees,
+        totalGameStakes,
+        totalGameWinnings,
+        netRevenue: totalDeposits - totalWithdrawals + totalFees,
+        chartData,
+        period
+      });
+    } catch (error) {
+      console.error("Error fetching financial statistics:", error);
+      res.status(500).json({ 
+        message: "Error fetching financial statistics",
+        totalDeposits: 0,
+        totalWithdrawals: 0,
+        totalFees: 0,
+        totalGameStakes: 0,
+        totalGameWinnings: 0,
+        netRevenue: 0,
+        chartData: [],
+        period: req.query.period || "week"
+      });
+    }
+  });
+  
+  // Admin User Activity endpoint
+  app.get("/api/admin/statistics/users", authenticateAdmin, async (req, res) => {
+    try {
+      const { period = "week" } = req.query;
+      
+      // Get all users with error handling
+      let users = [];
+      try {
+        users = await storage.getAllUsers();
+      } catch (err) {
+        console.error("Failed to fetch users for user statistics:", err);
+        users = []; // Fallback to empty array
+      }
+      
+      // Calculate date range based on period
+      const today = new Date();
+      let startDate = new Date();
+      
+      switch (period) {
+        case 'day':
+          startDate.setDate(today.getDate() - 1);
+          break;
+        case 'week':
+          startDate.setDate(today.getDate() - 7);
+          break;
+        case 'month':
+          startDate.setMonth(today.getMonth() - 1);
+          break;
+        case 'year':
+          startDate.setFullYear(today.getFullYear() - 1);
+          break;
+        default:
+          startDate.setDate(today.getDate() - 7); // Default to week
+      }
+      
+      // Filter users created in period (safely)
+      const usersInPeriod = users.filter(user => {
+        if (!user || !user.createdAt) return false;
+        try {
+          return new Date(user.createdAt) >= startDate;
+        } catch (e) {
+          console.error("Error parsing user date:", e);
+          return false;
+        }
+      });
+      
+      // Get all game players to calculate active users with error handling
+      const allGamePlayers = [];
+      let games = [];
+      
+      try {
+        games = await storage.getGames();
+      } catch (err) {
+        console.error("Failed to fetch games for user statistics:", err);
+        games = []; // Fallback to empty array
+      }
+      
+      // Safely process games and their players
+      for (const game of games) {
+        if (!game || !game.id || !game.createdAt) continue;
+        
+        try {
+          // Only include games in the selected period
+          if (new Date(game.createdAt) >= startDate) {
+            try {
+              const gamePlayers = await storage.getGamePlayers(game.id);
+              if (gamePlayers && Array.isArray(gamePlayers)) {
+                allGamePlayers.push(...gamePlayers);
+              }
+            } catch (err) {
+              console.error(`Failed to fetch players for game ${game.id}:`, err);
+            }
+          }
+        } catch (e) {
+          console.error("Error parsing game date:", e);
+        }
+      }
+      
+      // Get unique active user IDs (safely)
+      const activeUserIds = new Set();
+      allGamePlayers.forEach(gp => {
+        if (gp && gp.userId) {
+          activeUserIds.add(gp.userId);
+        }
+      });
+      
+      // Group registrations by day for chart data
+      const usersByDay = {};
+      
+      // Initialize all days in the period
+      for (let d = new Date(startDate); d <= today; d.setDate(d.getDate() + 1)) {
+        const dateStr = d.toISOString().split('T')[0];
+        usersByDay[dateStr] = 0;
+      }
+      
+      // Count users per day (safely)
+      usersInPeriod.forEach(user => {
+        if (user && user.createdAt) {
+          try {
+            const dateStr = new Date(user.createdAt).toISOString().split('T')[0];
+            usersByDay[dateStr] = (usersByDay[dateStr] || 0) + 1;
+          } catch (e) {
+            console.error("Error processing user date for chart:", e);
+          }
+        }
+      });
+      
+      // Format for chart data
+      const chartData = Object.entries(usersByDay).map(([date, count]) => ({
+        date,
+        newUsers: count
+      }));
+      
+      res.json({
+        totalNewUsers: usersInPeriod.length,
+        totalActiveUsers: activeUserIds.size,
+        totalUsers: users.length,
+        chartData,
+        period
+      });
+    } catch (error) {
+      console.error("Error fetching user statistics:", error);
+      res.status(500).json({ 
+        message: "Error fetching user statistics",
+        totalNewUsers: 0,
+        totalActiveUsers: 0,
+        totalUsers: 0,
+        chartData: [],
+        period: req.query.period || "week"
+      });
+    }
+  });
+  
+  return httpServer;
+}
